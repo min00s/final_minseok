@@ -1,10 +1,24 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:tflite_flutter/tflite_flutter.dart';
-import 'package:image/image.dart' as img;
 import 'dart:io';
-import 'dart:math';
+
+import 'config.dart';
+import 'gemini_repository.dart';
+import 'storage_service.dart';
+import 'fridge_screen.dart';
+import 'favorites_screen.dart';
+
+// ── 앱 전체 테마 컬러 ──────────────────────────────────────────────
+class AppColors {
+  static const bg        = Color(0xFFFDF6EE);
+  static const primary   = Color(0xFF5C8A5A);
+  static const secondary = Color(0xFFB87333);
+  static const accent    = Color(0xFFE8A87C);
+  static const card      = Color(0xFFFFFFFF);
+  static const textDark  = Color(0xFF3A2E1E);
+  static const textGrey  = Color(0xFF8C7B6B);
+  static const border    = Color(0xFFE0D4C3);
+}
 
 void main() => runApp(const KingJangoApp());
 
@@ -16,14 +30,18 @@ class KingJangoApp extends StatelessWidget {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        primarySwatch: Colors.green,
         useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(seedColor: AppColors.primary),
+        scaffoldBackgroundColor: AppColors.bg,
       ),
       home: const MainScreen(),
     );
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+//  메인 화면
+// ═══════════════════════════════════════════════════════════════════
 class MainScreen extends StatefulWidget {
   const MainScreen({super.key});
 
@@ -34,656 +52,760 @@ class MainScreen extends StatefulWidget {
 class _MainScreenState extends State<MainScreen> {
   File? _image;
   final picker = ImagePicker();
-  String _result = "식재료를 인식해 주세요!";
+
+  String _statusText = '하단 버튼으로 식재료를 인식해보세요!';
   bool _isLoading = false;
-
-  Interpreter? _interpreter;
-  List<String> _labels = [];
-  bool _modelReady = false;
-
-  // 인식된 식재료 이름 목록
   List<String> _detectedItems = [];
 
-  // YOLO 설정
-  static const int inputSize = 640;
-  static const double confidenceThreshold = 0.1;
-  static const double iouThreshold = 0.5;
+  late final GeminiRepository _geminiRepo;
+  final _storage = StorageService();
 
   @override
   void initState() {
     super.initState();
-    loadModel();
+    _geminiRepo = GeminiRepository(apiKey: geminiApiKey);
   }
 
-  Future<void> loadModel() async {
+  Future<void> _pickImage(ImageSource source) async {
+    final pickedFile = await picker.pickImage(source: source);
+    if (pickedFile == null) return;
+    setState(() {
+      _image = File(pickedFile.path);
+      _isLoading = true;
+      _statusText = '모델이 식재료를 인식 중...';
+      _detectedItems = [];
+    });
+    await _runGeminiDetection(_image!);
+  }
+
+  Future<void> _runGeminiDetection(File image) async {
     try {
-      _interpreter = await Interpreter.fromAsset('assets/food_model.tflite');
-
-      final labelData = await rootBundle.loadString('assets/labels.txt');
-      _labels = labelData.split('\n').where((e) => e.trim().isNotEmpty).toList();
-
-      print('모델 로드 완료! 라벨 수: ${_labels.length}');
-      print('라벨: $_labels');
-      print('입력 텐서: ${_interpreter!.getInputTensors()}');
-      print('출력 텐서: ${_interpreter!.getOutputTensors()}');
-
+      final items = await _geminiRepo.detectIngredientsFromImage(image);
       setState(() {
-        _modelReady = true;
-      });
-    } catch (e) {
-      print('모델 로드 오류: $e');
-      setState(() {
-        _result = "모델 로드 실패: $e";
-      });
-    }
-  }
-
-  // 카메라로 촬영
-  Future<void> getImageFromCamera() async {
-    if (!_modelReady) {
-      setState(() {
-        _result = "모델이 아직 로딩 중입니다. 잠시 기다려주세요.";
-      });
-      return;
-    }
-
-    final pickedFile = await picker.pickImage(source: ImageSource.camera);
-
-    if (pickedFile != null) {
-      setState(() {
-        _image = File(pickedFile.path);
-        _isLoading = true;
-        _result = "분석 중...";
-        _detectedItems = [];
-      });
-      await runModelOnImage(_image!);
-    }
-  }
-
-  // 갤러리에서 선택
-  Future<void> getImageFromGallery() async {
-    if (!_modelReady) {
-      setState(() {
-        _result = "모델이 아직 로딩 중입니다. 잠시 기다려주세요.";
-      });
-      return;
-    }
-
-    final pickedFile = await picker.pickImage(source: ImageSource.gallery);
-
-    if (pickedFile != null) {
-      setState(() {
-        _image = File(pickedFile.path);
-        _isLoading = true;
-        _result = "분석 중...";
-        _detectedItems = [];
-      });
-      await runModelOnImage(_image!);
-    }
-  }
-
-  Future<void> runModelOnImage(File image) async {
-    try {
-      if (_labels.isEmpty) {
-        setState(() {
-          _isLoading = false;
-          _result = "오류: 라벨 파일이 비어있습니다.";
-        });
-        return;
-      }
-
-      final imageBytes = await image.readAsBytes();
-      final decoded = img.decodeImage(imageBytes)!;
-      final resized = img.copyResize(decoded, width: inputSize, height: inputSize);
-
-      // 입력 텐서 준비 [1, 640, 640, 3] — HWC 형식, 0~1 정규화
-      var input = List.generate(
-        1,
-            (_) => List.generate(
-          inputSize,
-              (y) => List.generate(
-            inputSize,
-                (x) {
-              final pixel = resized.getPixel(x, y);
-              return [
-                pixel.r / 255.0,
-                pixel.g / 255.0,
-                pixel.b / 255.0,
-              ];
-            },
-          ),
-        ),
-      );
-
-      int numClasses = _labels.length;
-      int numDetections = 8400;
-      int outputChannels = 4 + numClasses;
-
-      var output = List.generate(
-        1,
-            (_) => List.generate(
-          outputChannels,
-              (_) => List.filled(numDetections, 0.0),
-        ),
-      );
-
-      _interpreter!.run(input, output);
-
-      // 디버깅 로그
-      double globalMax = 0;
-      int globalMaxIdx = 0;
-      int globalMaxClass = 0;
-      for (int i = 0; i < numDetections; i++) {
-        for (int c = 0; c < numClasses; c++) {
-          double score = output[0][4 + c][i];
-          if (score > globalMax) {
-            globalMax = score;
-            globalMaxIdx = i;
-            globalMaxClass = c;
-          }
-        }
-      }
-      print('최고 confidence: $globalMax');
-      if (globalMax > 0) {
-        print('최고 클래스: ${_labels[globalMaxClass]}');
-      }
-
-      // YOLO 출력 파싱
-      List<Map<String, dynamic>> detections = [];
-
-      for (int i = 0; i < numDetections; i++) {
-        double maxClassScore = 0;
-        int maxClassIndex = 0;
-
-        for (int c = 0; c < numClasses; c++) {
-          double score = output[0][4 + c][i];
-          if (score > maxClassScore) {
-            maxClassScore = score;
-            maxClassIndex = c;
-          }
-        }
-
-        if (maxClassScore > confidenceThreshold) {
-          detections.add({
-            'class': maxClassIndex,
-            'className': _labels[maxClassIndex],
-            'confidence': maxClassScore,
-            'x': output[0][0][i],
-            'y': output[0][1][i],
-            'w': output[0][2][i],
-            'h': output[0][3][i],
-          });
-        }
-      }
-
-      detections = _nms(detections);
-
-      setState(() {
+        _detectedItems = items;
         _isLoading = false;
-        if (detections.isNotEmpty) {
-          // 중복 제거하여 이름만 추출 (확률 표시 안 함)
-          Set<String> foundItems = {};
-          for (var det in detections) {
-            foundItems.add(det['className']);
-          }
-          _detectedItems = foundItems.toList();
-          _result = "발견된 식재료:";
-        } else {
-          _detectedItems = [];
-          _result = "식재료를 인식하지 못했습니다.\n다시 시도해 주세요.";
-        }
+        _statusText = items.isEmpty
+            ? '식재료를 인식하지 못했습니다.\n다시 시도해 주세요.'
+            : '발견된 식재료:';
       });
     } catch (e) {
       setState(() {
         _isLoading = false;
-        _result = "오류 발생: $e";
-      });
-      print('추론 오류: $e');
-    }
-  }
-
-  List<Map<String, dynamic>> _nms(List<Map<String, dynamic>> detections) {
-    detections.sort((a, b) => (b['confidence'] as double).compareTo(a['confidence'] as double));
-    List<Map<String, dynamic>> result = [];
-
-    while (detections.isNotEmpty) {
-      var best = detections.removeAt(0);
-      result.add(best);
-      detections.removeWhere((det) {
-        if (det['class'] != best['class']) return false;
-        return _calculateIoU(best, det) > iouThreshold;
+        _statusText = '인식 중 오류가 발생했습니다.';
       });
     }
-    return result;
   }
 
-  double _calculateIoU(Map<String, dynamic> a, Map<String, dynamic> b) {
-    double ax1 = a['x'] - a['w'] / 2;
-    double ay1 = a['y'] - a['h'] / 2;
-    double ax2 = a['x'] + a['w'] / 2;
-    double ay2 = a['y'] + a['h'] / 2;
-    double bx1 = b['x'] - b['w'] / 2;
-    double by1 = b['y'] - b['h'] / 2;
-    double bx2 = b['x'] + b['w'] / 2;
-    double by2 = b['y'] + b['h'] / 2;
-    double interX1 = max(ax1, bx1);
-    double interY1 = max(ay1, by1);
-    double interX2 = min(ax2, bx2);
-    double interY2 = min(ay2, by2);
-    double interArea = max(0, interX2 - interX1) * max(0, interY2 - interY1);
-    double aArea = (ax2 - ax1) * (ay2 - ay1);
-    double bArea = (bx2 - bx1) * (by2 - by1);
-    return interArea / (aArea + bArea - interArea);
-  }
-
-  // 레시피 추천 페이지로 이동
-  void _goToRecipe() {
+  Future<void> _showAddToFridgeDialog() async {
     if (_detectedItems.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('먼저 식재료를 인식해 주세요!'),
-          backgroundColor: Colors.orange,
-        ),
-      );
+      _showSnack('먼저 식재료를 인식해 주세요!');
       return;
     }
+    final added = await showDialog<bool>(
+      context: context,
+      builder: (_) => AddToFridgeDialog(
+        detectedItems: _detectedItems,
+        storage: _storage,
+        geminiRepo: _geminiRepo,
+      ),
+    );
+    if (added == true && mounted) {
+      _showSnack('냉장고에 추가됐어요! 🧊', color: AppColors.primary);
+    }
+  }
 
-    Navigator.push(
+  void _goToRecipe(List<String> ingredients) {
+    if (ingredients.isEmpty) {
+      _showSnack('먼저 식재료를 인식해 주세요!');
+      return;
+    }
+    Navigator.push(context, MaterialPageRoute(
+      builder: (_) => RecipeScreen(
+          ingredients: ingredients, geminiRepo: _geminiRepo),
+    ));
+  }
+
+  Future<void> _openFridge() async {
+    final result = await Navigator.push<List<String>>(
       context,
       MaterialPageRoute(
-        builder: (context) => RecipeScreen(ingredients: _detectedItems),
-      ),
+          builder: (_) => FridgeScreen(geminiRepo: _geminiRepo)),
     );
+    if (result != null && result.isNotEmpty && mounted) {
+      _goToRecipe(result);
+    }
   }
 
-  @override
-  void dispose() {
-    _interpreter?.close();
-    super.dispose();
+  void _showSnack(String msg, {Color? color}) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(msg),
+      backgroundColor: color ?? AppColors.secondary,
+      duration: const Duration(seconds: 2),
+    ));
   }
 
   @override
   Widget build(BuildContext context) {
-    return _isLoading ? buildLoadingScreen() : buildMainScreen();
+    return _isLoading ? _buildLoadingScreen() : _buildMainScreen();
   }
 
-  Widget buildMainScreen() {
-    return Scaffold(
-      backgroundColor: const Color(0xFFF1F8E9),
-      appBar: AppBar(
-        title: const Text('킹장고를 부탁해 🥕',
-            style: TextStyle(fontWeight: FontWeight.bold)),
-        backgroundColor: Colors.green,
-        foregroundColor: Colors.white,
-        centerTitle: true,
-        elevation: 2,
-      ),
-      body: SingleChildScrollView(
-        child: Column(
-          children: [
-            const SizedBox(height: 20),
-
-            // 이미지 영역
-            Center(
-              child: Container(
-                width: 320,
-                height: 320,
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(25),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.grey.withOpacity(0.3),
-                      spreadRadius: 2,
-                      blurRadius: 10,
-                      offset: const Offset(0, 5),
-                    ),
-                  ],
-                ),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(25),
-                  child: Image(
-                    image: _image == null
-                        ? const AssetImage('assets/vegetable.png.jpg')
-                    as ImageProvider
-                        : FileImage(_image!),
-                    fit: BoxFit.cover,
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(height: 20),
-
-            // 인식 결과 영역
-            Container(
-              margin: const EdgeInsets.symmetric(horizontal: 20),
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(20),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.grey.withOpacity(0.15),
-                    spreadRadius: 1,
-                    blurRadius: 5,
-                  ),
-                ],
-              ),
-              child: Column(
-                children: [
-                  Text(
-                    _result,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.green,
-                    ),
-                  ),
-                  if (_detectedItems.isNotEmpty) ...[
-                    const SizedBox(height: 10),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      alignment: WrapAlignment.center,
-                      children: _detectedItems.map((item) {
-                        return Chip(
-                          avatar: const Icon(Icons.eco, color: Colors.white, size: 18),
-                          label: Text(item, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-                          backgroundColor: Colors.green,
-                        );
-                      }).toList(),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-            const SizedBox(height: 20),
-
-            // 카메라 & 갤러리 버튼
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 30),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: ElevatedButton.icon(
-                      onPressed: getImageFromCamera,
-                      icon: const Icon(Icons.camera_alt),
-                      label: const Text('카메라', style: TextStyle(fontSize: 16)),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.green,
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(vertical: 14),
-                        shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(30)),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: ElevatedButton.icon(
-                      onPressed: getImageFromGallery,
-                      icon: const Icon(Icons.photo_library),
-                      label: const Text('갤러리', style: TextStyle(fontSize: 16)),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.green.shade700,
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(vertical: 14),
-                        shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(30)),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 15),
-
-            // 레시피 추천 버튼
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 30),
-              child: SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  onPressed: _goToRecipe,
-                  icon: const Icon(Icons.restaurant_menu),
-                  label: const Text('레시피 추천받기', style: TextStyle(fontSize: 18)),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.orange,
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 15),
-                    shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(30)),
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(height: 30),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget buildLoadingScreen() {
+  Widget _buildMainScreen() {
     return Scaffold(
       backgroundColor: Colors.white,
-      body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Image.asset('assets/skku.jpg', width: 200, fit: BoxFit.contain),
-            const SizedBox(height: 50),
-            const CircularProgressIndicator(
-                color: Colors.green, strokeWidth: 5),
-            const SizedBox(height: 30),
-            const Text(
-              "AI가 식재료를 신속하게 분석 중입니다...",
-              style: TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.grey),
-            ),
-            const SizedBox(height: 10),
-            const Text("잠시만 기다려 주세요.",
-                style: TextStyle(fontSize: 16, color: Colors.grey)),
-          ],
-        ),
-      ),
+      body: _detectedItems.isEmpty
+          ? _buildHomePage()
+          : _buildResultPage(),
     );
   }
-}
 
-// ========== 레시피 추천 화면 ==========
-class RecipeScreen extends StatelessWidget {
-  final List<String> ingredients;
-
-  const RecipeScreen({super.key, required this.ingredients});
-
-  // 식재료 기반 레시피 데이터
-  List<Map<String, dynamic>> getRecipes() {
-    List<Map<String, dynamic>> allRecipes = [
-      {
-        'name': '계란말이',
-        'ingredients': ['Egg'],
-        'description': '부드럽고 촉촉한 계란말이',
-        'icon': '🍳',
-      },
-      {
-        'name': '양파볶음',
-        'ingredients': ['Onion'],
-        'description': '달콤하게 볶은 양파볶음',
-        'icon': '🧅',
-      },
-      {
-        'name': '감자볶음',
-        'ingredients': ['Potato'],
-        'description': '바삭한 감자볶음',
-        'icon': '🥔',
-      },
-      {
-        'name': '토마토 스파게티',
-        'ingredients': ['Tomato'],
-        'description': '신선한 토마토 소스 스파게티',
-        'icon': '🍝',
-      },
-      {
-        'name': '당근라페',
-        'ingredients': ['carrot'],
-        'description': '상큼한 프렌치 당근 샐러드',
-        'icon': '🥕',
-      },
-      {
-        'name': '스페니시 오믈렛',
-        'ingredients': ['Egg', 'Potato', 'Onion'],
-        'description': '감자와 양파가 들어간 스페인식 오믈렛',
-        'icon': '🍳',
-      },
-      {
-        'name': '토마토 계란볶음',
-        'ingredients': ['Tomato', 'Egg'],
-        'description': '중국식 토마토 계란볶음',
-        'icon': '🍅',
-      },
-      {
-        'name': '카레',
-        'ingredients': ['Potato', 'Onion', 'carrot'],
-        'description': '감자, 양파, 당근이 들어간 카레',
-        'icon': '🍛',
-      },
-      {
-        'name': '야채볶음',
-        'ingredients': ['Onion', 'carrot'],
-        'description': '양파와 당근을 넣은 야채볶음',
-        'icon': '🥘',
-      },
-      {
-        'name': '감자샐러드',
-        'ingredients': ['Potato', 'Egg', 'carrot'],
-        'description': '부드러운 감자샐러드',
-        'icon': '🥗',
-      },
-    ];
-
-    // 내가 가진 식재료로 만들 수 있는 레시피 필터링
-    List<Map<String, dynamic>> matchedRecipes = [];
-    for (var recipe in allRecipes) {
-      List<String> needed = List<String>.from(recipe['ingredients']);
-      bool canMake = needed.every((item) => ingredients.contains(item));
-      if (canMake) {
-        matchedRecipes.add(recipe);
-      }
-    }
-
-    return matchedRecipes;
+  // ── 탐지 전: 홈 이미지 + 버튼 ────────────────────────────────────
+  Widget _buildHomePage() {
+    return Column(
+      children: [
+        Expanded(
+          child: Image.asset(
+            'assets/homepage.png',
+            fit: BoxFit.contain,
+            alignment: Alignment.center,
+          ),
+        ),
+        _buildBottomButtons(),
+      ],
+    );
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final recipes = getRecipes();
-
-    return Scaffold(
-      backgroundColor: const Color(0xFFF1F8E9),
-      appBar: AppBar(
-        title: const Text('레시피 추천 🍽️',
-            style: TextStyle(fontWeight: FontWeight.bold)),
-        backgroundColor: Colors.orange,
-        foregroundColor: Colors.white,
-        centerTitle: true,
-        elevation: 2,
-      ),
-      body: Column(
-        children: [
-          // 내 식재료 표시
-          Container(
-            width: double.infinity,
-            margin: const EdgeInsets.all(16),
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: Colors.white,
-              borderRadius: BorderRadius.circular(20),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.grey.withOpacity(0.15),
-                  spreadRadius: 1,
-                  blurRadius: 5,
-                ),
-              ],
-            ),
+  // ── 탐지 후: 깔끔한 결과 화면 ─────────────────────────────────────
+  Widget _buildResultPage() {
+    return Column(
+      children: [
+        Expanded(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(20, 24, 20, 16),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
-                  '🧊 내 식재료',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                // 탐지된 사진
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(20),
+                  child: _image != null
+                      ? Image.file(_image!,
+                      width: double.infinity,
+                      height: 220,
+                      fit: BoxFit.cover)
+                      : const SizedBox.shrink(),
                 ),
-                const SizedBox(height: 10),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: ingredients.map((item) {
-                    return Chip(
-                      label: Text(item, style: const TextStyle(color: Colors.white)),
-                      backgroundColor: Colors.green,
-                    );
-                  }).toList(),
+                const SizedBox(height: 20),
+
+                // 발견된 식재료 카드
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(18),
+                  decoration: BoxDecoration(
+                    color: AppColors.card,
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(color: AppColors.border),
+                    boxShadow: [
+                      BoxShadow(
+                        color: AppColors.secondary.withValues(alpha: 0.08),
+                        blurRadius: 10,
+                        offset: const Offset(0, 3),
+                      )
+                    ],
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('🥬 발견된 식재료',
+                          style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.bold,
+                              color: AppColors.textDark)),
+                      const SizedBox(height: 12),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: _detectedItems
+                            .map((item) => _IngredientChip(label: item))
+                            .toList(),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+
+                // 액션 버튼 2개
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: _showAddToFridgeDialog,
+                        icon: const Icon(Icons.kitchen, size: 17),
+                        label: const Text('냉장고에 추가',
+                            style: TextStyle(fontSize: 14)),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: AppColors.secondary,
+                          side: const BorderSide(
+                              color: AppColors.secondary, width: 1.5),
+                          padding:
+                          const EdgeInsets.symmetric(vertical: 13),
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(30)),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        onPressed: () => _goToRecipe(_detectedItems),
+                        icon: const Icon(Icons.restaurant_menu, size: 17),
+                        label: const Text('레시피 추천',
+                            style: TextStyle(fontSize: 14)),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: AppColors.accent,
+                          foregroundColor: Colors.white,
+                          padding:
+                          const EdgeInsets.symmetric(vertical: 13),
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(30)),
+                          elevation: 0,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+
+                // 다시 찍기 버튼
+                SizedBox(
+                  width: double.infinity,
+                  child: TextButton.icon(
+                    onPressed: () => setState(() {
+                      _detectedItems = [];
+                      _image = null;
+                      _statusText = '하단 버튼으로 식재료를 인식해보세요!';
+                    }),
+                    icon: const Icon(Icons.arrow_back,
+                        size: 16, color: AppColors.textGrey),
+                    label: const Text('돌아가기',
+                        style: TextStyle(
+                            color: AppColors.textGrey, fontSize: 14)),
+                  ),
                 ),
               ],
             ),
           ),
+        ),
+        _buildBottomButtons(),
+      ],
+    );
+  }
 
-          // 레시피 목록
-          Expanded(
-            child: recipes.isEmpty
-                ? const Center(
-              child: Text(
-                '만들 수 있는 레시피가 없습니다.\n더 많은 식재료를 추가해 보세요!',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 16, color: Colors.grey),
-              ),
-            )
-                : ListView.builder(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              itemCount: recipes.length,
-              itemBuilder: (context, index) {
-                final recipe = recipes[index];
-                return Card(
-                  margin: const EdgeInsets.only(bottom: 12),
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(20)),
-                  elevation: 2,
-                  child: ListTile(
-                    contentPadding: const EdgeInsets.all(16),
-                    leading: Text(
-                      recipe['icon'],
-                      style: const TextStyle(fontSize: 40),
-                    ),
-                    title: Text(
-                      recipe['name'],
-                      style: const TextStyle(
-                          fontSize: 18, fontWeight: FontWeight.bold),
-                    ),
-                    subtitle: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const SizedBox(height: 4),
-                        Text(recipe['description']),
-                        const SizedBox(height: 6),
-                        Text(
-                          '재료: ${(recipe['ingredients'] as List).join(", ")}',
-                          style: TextStyle(
-                              color: Colors.green.shade700,
-                              fontSize: 12),
-                        ),
-                      ],
-                    ),
-                  ),
-                );
-              },
+  Widget _buildBottomButtons() {
+    return Container(
+      color: Colors.white,
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceAround,
+        children: [
+          _BottomIconButton(
+            icon: Icons.camera_alt,
+            label: '카메라',
+            onTap: () => _pickImage(ImageSource.camera),
+          ),
+          _BottomIconButton(
+            icon: Icons.photo_library,
+            label: '갤러리',
+            onTap: () => _pickImage(ImageSource.gallery),
+          ),
+          _BottomIconButton(
+            icon: Icons.kitchen,
+            label: '냉장고',
+            onTap: _openFridge,
+          ),
+          _BottomIconButton(
+            icon: Icons.star,
+            label: '즐겨찾기',
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const FavoritesScreen()),
             ),
           ),
         ],
       ),
     );
   }
+
+  Widget _buildLoadingScreen() {
+    return Scaffold(
+      backgroundColor: Colors.white,
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Image.asset('assets/homepage.png',
+                width: 260, fit: BoxFit.contain),
+            const SizedBox(height: 36),
+            const CircularProgressIndicator(
+                color: AppColors.primary, strokeWidth: 4),
+            const SizedBox(height: 20),
+            const Text('모델이 식재료를 인식 중입니다...',
+                style: TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.bold,
+                    color: AppColors.textGrey)),
+            const SizedBox(height: 6),
+            const Text('잠시만 기다려 주세요.',
+                style:
+                TextStyle(fontSize: 13, color: AppColors.textGrey)),
+          ],
+        ),
+      ),
+    );
+  }
+
+}
+
+// ── 하단 아이콘 버튼 ───────────────────────────────────────────────
+class _BottomIconButton extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+
+  const _BottomIconButton({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 64,
+            height: 64,
+            decoration: BoxDecoration(
+              color: const Color(0xFFF5EDE0),
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(color: AppColors.border, width: 1.5),
+            ),
+            child: Icon(icon, color: AppColors.secondary, size: 30),
+          ),
+          const SizedBox(height: 6),
+          Text(label,
+              style: const TextStyle(
+                  fontSize: 13,
+                  color: AppColors.textDark,
+                  fontWeight: FontWeight.w500)),
+        ],
+      ),
+    );
+  }
+}
+
+// ── 재료 칩 ────────────────────────────────────────────────────────
+class _IngredientChip extends StatelessWidget {
+  final String label;
+  const _IngredientChip({required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      decoration: BoxDecoration(
+        color: AppColors.primary.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: AppColors.primary.withValues(alpha: 0.3)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.eco, size: 13, color: AppColors.primary),
+          const SizedBox(width: 4),
+          Text(label,
+              style: const TextStyle(
+                  color: AppColors.primary,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 12)),
+        ],
+      ),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  레시피 추천 화면
+// ═══════════════════════════════════════════════════════════════════
+class RecipeScreen extends StatefulWidget {
+  final List<String> ingredients;
+  final GeminiRepository geminiRepo;
+
+  const RecipeScreen(
+      {super.key, required this.ingredients, required this.geminiRepo});
+
+  @override
+  State<RecipeScreen> createState() => _RecipeScreenState();
+}
+
+class _RecipeScreenState extends State<RecipeScreen> {
+  List<RecipeRecommendation> _recipes = [];
+  bool _isLoading = true;
+  String? _errorMessage;
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchRecipes();
+  }
+
+  Future<void> _fetchRecipes() async {
+    setState(() { _isLoading = true; _errorMessage = null; });
+    try {
+      final recipes = await widget.geminiRepo
+          .getRecipeRecommendations(widget.ingredients);
+      setState(() { _recipes = recipes; _isLoading = false; });
+    } catch (e) {
+      setState(() { _errorMessage = e.toString(); _isLoading = false; });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: AppColors.bg,
+      appBar: AppBar(
+        title: const Text('레시피 추천 🍽️',
+            style: TextStyle(
+                fontWeight: FontWeight.bold, color: AppColors.textDark)),
+        backgroundColor: AppColors.bg,
+        elevation: 0,
+        iconTheme: const IconThemeData(color: AppColors.textDark),
+        centerTitle: true,
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(1),
+          child: Container(height: 1, color: AppColors.border),
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh, color: AppColors.secondary),
+            onPressed: _isLoading ? null : _fetchRecipes,
+          )
+        ],
+      ),
+      body: Column(
+        children: [
+          Container(
+            width: double.infinity,
+            margin: const EdgeInsets.all(16),
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: AppColors.card,
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(color: AppColors.border),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('🧊 내 식재료',
+                    style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.bold,
+                        color: AppColors.textDark)),
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: widget.ingredients
+                      .map((item) => _IngredientChip(label: item))
+                      .toList(),
+                ),
+              ],
+            ),
+          ),
+          Expanded(child: _buildBody()),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBody() {
+    if (_isLoading) {
+      return const Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            CircularProgressIndicator(color: AppColors.accent),
+            SizedBox(height: 16),
+            Text('Gemini가 레시피를 생성 중입니다...',
+                style: TextStyle(color: AppColors.textGrey, fontSize: 15)),
+          ],
+        ),
+      );
+    }
+    if (_errorMessage != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(Icons.error_outline,
+                  color: Colors.redAccent, size: 48),
+              const SizedBox(height: 12),
+              Text(_errorMessage!,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.redAccent)),
+              const SizedBox(height: 20),
+              ElevatedButton.icon(
+                onPressed: _fetchRecipes,
+                icon: const Icon(Icons.refresh),
+                label: const Text('다시 시도'),
+                style: ElevatedButton.styleFrom(
+                    backgroundColor: AppColors.accent,
+                    foregroundColor: Colors.white),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    if (_recipes.isEmpty) {
+      return const Center(
+          child: Text('추천할 레시피를 찾지 못했습니다.',
+              style: TextStyle(color: AppColors.textGrey, fontSize: 15)));
+    }
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      itemCount: _recipes.length,
+      itemBuilder: (_, i) => _RecipeCard(recipe: _recipes[i]),
+    );
+  }
+}
+
+// ── 레시피 카드 ────────────────────────────────────────────────────
+class _RecipeCard extends StatefulWidget {
+  final RecipeRecommendation recipe;
+  const _RecipeCard({required this.recipe});
+
+  @override
+  State<_RecipeCard> createState() => _RecipeCardState();
+}
+
+class _RecipeCardState extends State<_RecipeCard> {
+  bool _expanded = false;
+  bool _isFavorite = false;
+  final _storage = StorageService();
+
+  @override
+  void initState() {
+    super.initState();
+    _checkFavorite();
+  }
+
+  Future<void> _checkFavorite() async {
+    final fav = await _storage.isFavorite(widget.recipe.title);
+    if (mounted) setState(() => _isFavorite = fav);
+  }
+
+  Future<void> _toggleFavorite() async {
+    if (_isFavorite) {
+      await _storage.removeFavorite(widget.recipe.title);
+    } else {
+      await _storage.addFavorite(widget.recipe);
+    }
+    setState(() => _isFavorite = !_isFavorite);
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(_isFavorite ? '즐겨찾기에 추가됐어요 ⭐' : '즐겨찾기에서 삭제됐어요'),
+        backgroundColor: _isFavorite
+            ? const Color(0xFF9B7940)
+            : Colors.grey.shade600,
+        duration: const Duration(seconds: 2),
+      ));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final recipe = widget.recipe;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      decoration: BoxDecoration(
+        color: AppColors.card,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: AppColors.border),
+        boxShadow: [
+          BoxShadow(
+              color: AppColors.secondary.withValues(alpha: 0.07),
+              blurRadius: 8,
+              offset: const Offset(0, 2))
+        ],
+      ),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(18),
+        onTap: () => setState(() => _expanded = !_expanded),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    width: 40,
+                    height: 40,
+                    decoration: BoxDecoration(
+                      color: AppColors.accent.withValues(alpha: 0.2),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: const Icon(Icons.restaurant,
+                        color: AppColors.accent, size: 22),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(recipe.title,
+                            style: const TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                                color: AppColors.textDark)),
+                        const SizedBox(height: 2),
+                        Text(recipe.summary,
+                            style: const TextStyle(
+                                fontSize: 12, color: AppColors.textGrey)),
+                      ],
+                    ),
+                  ),
+                  if (recipe.calories > 0)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: AppColors.accent.withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Text('${recipe.calories}kcal',
+                          style: const TextStyle(
+                              fontSize: 11,
+                              color: AppColors.secondary,
+                              fontWeight: FontWeight.bold)),
+                    ),
+                  IconButton(
+                    icon: Icon(
+                      _isFavorite ? Icons.star : Icons.star_border,
+                      color: _isFavorite
+                          ? const Color(0xFF9B7940)
+                          : AppColors.border,
+                      size: 22,
+                    ),
+                    onPressed: _toggleFavorite,
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                  ),
+                  const SizedBox(width: 4),
+                  Icon(
+                      _expanded ? Icons.expand_less : Icons.expand_more,
+                      color: AppColors.textGrey, size: 20),
+                ],
+              ),
+              if (_expanded) ...[
+                const SizedBox(height: 14),
+                const Divider(color: AppColors.border, height: 1),
+                const SizedBox(height: 12),
+                _sectionTitle('📋 재료'),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: recipe.ingredients
+                      .map((ing) => Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 10, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: AppColors.primary.withValues(alpha: 0.08),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                          color: AppColors.primary
+                              .withValues(alpha: 0.2)),
+                    ),
+                    child: Text(ing,
+                        style: const TextStyle(
+                            fontSize: 12,
+                            color: AppColors.primary)),
+                  ))
+                      .toList(),
+                ),
+                const SizedBox(height: 12),
+                _sectionTitle('🍳 조리 순서'),
+                const SizedBox(height: 8),
+                ...recipe.steps.asMap().entries.map((e) => Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Container(
+                        width: 24,
+                        height: 24,
+                        decoration: BoxDecoration(
+                          color: AppColors.accent,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Center(
+                          child: Text('${e.key + 1}',
+                              style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.bold)),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                          child: Text(e.value,
+                              style: const TextStyle(
+                                  fontSize: 13,
+                                  color: AppColors.textDark))),
+                    ],
+                  ),
+                )),
+                if (recipe.tip.isNotEmpty) ...[
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFFFF8EC),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                          color: AppColors.accent.withValues(alpha: 0.4)),
+                    ),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('💡 ', style: TextStyle(fontSize: 14)),
+                        Expanded(
+                          child: Text(recipe.tip,
+                              style: const TextStyle(
+                                  fontSize: 12,
+                                  color: AppColors.secondary)),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _sectionTitle(String text) => Text(text,
+      style: const TextStyle(
+          fontWeight: FontWeight.bold,
+          fontSize: 13,
+          color: AppColors.textDark));
 }
